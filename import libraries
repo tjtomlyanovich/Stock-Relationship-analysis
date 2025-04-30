@@ -1,0 +1,1 @@
+pip install --upgrade pandas numpy statsmodels matplotlib wrds gradio psycopg2-binary
