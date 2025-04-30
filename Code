@@ -1,0 +1,153 @@
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+import wrds
+import gradio as gr
+
+def fetch_returns(ticker: str, years: int, wrds_username: str, wrds_password: str) -> pd.Series:
+    """
+    Fetch daily stock return data from WRDS using the CRSP dataset.
+    """
+    db = wrds.Connection(wrds_username=wrds_username, wrds_password=wrds_password)
+    end_date = datetime.today()
+    start_date = end_date - timedelta(days=int(years * 365.25))
+
+    query = f"""
+        SELECT date, ret
+        FROM crsp.dsf
+        WHERE permno IN (
+            SELECT permno FROM crsp.stocknames
+            WHERE ticker = '{ticker}'
+            AND '{start_date.date()}' BETWEEN namedt AND nameenddt
+        )
+        AND date BETWEEN '{start_date.date()}' AND '{end_date.date()}'
+        ORDER BY date;
+    """
+
+    data = db.raw_sql(query, date_cols=['date'])
+    db.close()
+
+    if data.empty or 'ret' not in data.columns:
+        raise ValueError(f"No valid data retrieved from WRDS for {ticker}.")
+
+    returns_series = data.set_index('date')['ret'].astype(float).rename(ticker).dropna()
+    return returns_series
+
+if __name__ == "__main__":
+    # ========================================
+    # Gradio Web Interface for Cov & Reg Analyzer
+    # ========================================
+    def gradio_analyze(wrds_username, wrds_password, ticker1, ticker2, years):
+        ticker1 = ticker1.upper().strip()
+        ticker2 = ticker2.upper().strip()
+        # Fetch returns via WRDS
+        try:
+            returns1 = fetch_returns(ticker1, years, wrds_username, wrds_password)
+            returns2 = fetch_returns(ticker2, years, wrds_username, wrds_password)
+        except Exception as e:
+            return "", "", None, None, None, None, None, None, f"Error fetching data: {e}"
+
+        # Combine and compute stats
+        combined = pd.concat([returns1, returns2], axis=1).dropna()
+        combined.columns = [ticker1, ticker2]
+        cov_val = combined[ticker1].cov(combined[ticker2])
+        corr_val = combined[ticker1].corr(combined[ticker2])
+
+        # Regression
+        X = sm.add_constant(combined[ticker1])
+        model = sm.OLS(combined[ticker2], X).fit()
+        summary_str = model.summary().as_text()
+
+        # Scatter plot
+        fig_scatter, ax1 = plt.subplots()
+        ax1.scatter(combined[ticker1], combined[ticker2], alpha=0.5)
+        ax1.plot(combined[ticker1], model.predict(X), color="red", lw=2)
+        ax1.set_xlabel(f"{ticker1} Returns")
+        ax1.set_ylabel(f"{ticker2} Returns")
+        ax1.set_title("Scatter: Returns Relationship")
+
+        # Time series plot of cumulative returns
+        cum_returns = (1 + combined).cumprod()
+        fig_ts, ax2 = plt.subplots()
+        ax2.plot(cum_returns.index, cum_returns[ticker1], label=ticker1)
+        ax2.plot(cum_returns.index, cum_returns[ticker2], label=ticker2)
+        ax2.set_xlabel("Date")
+        ax2.set_ylabel("Cumulative Return")
+        ax2.set_title("Cumulative Return Over Time")
+        ax2.legend()
+
+        # Rolling 60‑day correlation between the two tickers
+        rolling_corr = combined[ticker1].rolling(window=60).corr(combined[ticker2])
+        fig_corr, ax3 = plt.subplots()
+        ax3.plot(rolling_corr.index, rolling_corr, label='Rolling 60‑day Correlation')
+        ax3.set_xlabel('Date')
+        ax3.set_ylabel('Correlation')
+        ax3.set_title('Rolling 60‑Day Correlation')
+        ax3.legend()
+
+        # Rolling 60‑day covariance between the two tickers
+        rolling_cov = combined[ticker1].rolling(window=60).cov(combined[ticker2])
+        fig_cov, ax4 = plt.subplots()
+        ax4.plot(rolling_cov.index, rolling_cov, label='Rolling 60‑day Covariance')
+        ax4.set_xlabel('Date')
+        ax4.set_ylabel('Covariance')
+        ax4.set_title('Rolling 60‑Day Covariance')
+        ax4.legend()
+
+        # Drawdown chart
+        drawdown1 = cum_returns[ticker1] / cum_returns[ticker1].cummax() - 1
+        drawdown2 = cum_returns[ticker2] / cum_returns[ticker2].cummax() - 1
+        fig_dd, ax5 = plt.subplots()
+        ax5.plot(drawdown1.index, drawdown1, label=f'{ticker1} Drawdown')
+        ax5.plot(drawdown2.index, drawdown2, label=f'{ticker2} Drawdown')
+        ax5.set_xlabel('Date')
+        ax5.set_ylabel('Drawdown')
+        ax5.set_title('Portfolio Drawdown')
+        ax5.legend()
+
+        # Return distribution histograms
+        fig_hist, ax6 = plt.subplots()
+        ax6.hist(combined[ticker1], bins=50, alpha=0.5, label=ticker1)
+        ax6.hist(combined[ticker2], bins=50, alpha=0.5, label=ticker2)
+        ax6.set_title('Return Distribution')
+        ax6.set_xlabel('Daily Return')
+        ax6.set_ylabel('Frequency')
+        ax6.legend()
+
+        return (
+            f"{cov_val:.6f}",
+            f"{corr_val:.4f}",
+            fig_scatter,
+            fig_ts,
+            fig_corr,
+            fig_cov,
+            fig_dd,
+            fig_hist,
+            summary_str
+        )
+
+    gr.Interface(
+        fn=gradio_analyze,
+        inputs=[
+          gr.Textbox(label="WRDS Username", placeholder="your WRDS username"),
+          gr.Textbox(label="WRDS Password", type="password", placeholder="your WRDS password"),
+          gr.Textbox(label="Independent ticker", value="AAPL"),
+          gr.Textbox(label="Dependent ticker", value="MSFT"),
+          gr.Slider(1, 10, value=3, step=1, label="Years of history")
+        ],
+        outputs=[
+          gr.Textbox(label="Covariance"),
+          gr.Textbox(label="Correlation"),
+          gr.Plot(label="Scatter Plot"),
+          gr.Plot(label="Cumulative Returns"),
+          gr.Plot(label="Rolling Correlation"),
+          gr.Plot(label="Rolling Covariance"),
+          gr.Plot(label="Drawdown"),
+          gr.Plot(label="Return Distribution"),
+          gr.Textbox(label="Regression Summary", lines=10)
+        ],
+        title="Covariance & Regression Analyzer",
+        description="Enter WRDS credentials, two tickers, and the lookback window (years) to compute covariance, correlation, regression summary, and display plots.",
+    ).launch(share=True, inbrowser=True)
